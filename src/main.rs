@@ -511,7 +511,7 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    let identity = load_identity("certsOld/identity.pfx", "toor").unwrap();
+    let identity = load_identity("certs/identity.pfx", "toor").unwrap();
 
     // Create native_tls acceptor
     let native_acceptor = NativeTlsAcceptor::builder(identity)
